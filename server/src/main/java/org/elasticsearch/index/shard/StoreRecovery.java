@@ -95,7 +95,7 @@ final class StoreRecovery {
                 "expected store recovery type but was: " + recoveryType;
             ActionListener.completeWith(recoveryListener(indexShard, listener), () -> {
                 logger.debug("starting recovery from store ...");
-                internalRecoverFromStore(indexShard);
+                internalRecoverFromStore(indexShard); // 获取其中的版本号，更新当前索引版本
                 return true;
             });
         } else {
@@ -368,12 +368,13 @@ final class StoreRecovery {
 
     /**
      * Recovers the state of the shard from the store.
+     * 获取其中的版本号，更新当前索引版本
      */
     private void internalRecoverFromStore(IndexShard indexShard) throws IndexShardRecoveryException {
         indexShard.preRecovery();
         final RecoveryState recoveryState = indexShard.recoveryState();
         final boolean indexShouldExists = recoveryState.getRecoverySource().getType() != RecoverySource.Type.EMPTY_STORE;
-        indexShard.prepareForIndexRecovery();
+        indexShard.prepareForIndexRecovery(); // 进入INDEX阶段
         SegmentInfos si = null;
         final Store store = indexShard.store();
         store.incRef();
@@ -381,7 +382,7 @@ final class StoreRecovery {
             try {
                 store.failIfCorrupted();
                 try {
-                    si = store.readLastCommittedSegmentsInfo();
+                    si = store.readLastCommittedSegmentsInfo();  // 获取Lucene最后一次提交的分段信息，得到其中的版本号
                 } catch (Exception e) {
                     String files = "_unknown_";
                     try {
@@ -433,10 +434,10 @@ final class StoreRecovery {
                 writeEmptyRetentionLeasesFile(indexShard);
                 indexShard.recoveryState().getIndex().setFileDetailsComplete();
             }
-            indexShard.openEngineAndRecoverFromTranslog();
+            indexShard.openEngineAndRecoverFromTranslog(); // 从tanslog恢复数据
             indexShard.getEngine().fillSeqNoGaps(indexShard.getPendingPrimaryTerm());
-            indexShard.finalizeRecovery();
-            indexShard.postRecovery("post recovery from shard_store");
+            indexShard.finalizeRecovery(); // 进入FINALIZE状态
+            indexShard.postRecovery("post recovery from shard_store"); // 进入DONE阶段
         } catch (EngineException | IOException e) {
             throw new IndexShardRecoveryException(shardId, "failed to recover from gateway", e);
         } finally {

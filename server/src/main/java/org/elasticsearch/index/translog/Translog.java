@@ -215,7 +215,10 @@ public class Translog extends AbstractIndexShardComponent implements IndexShardC
         }
     }
 
-    /** recover all translog files found on disk */
+    /**
+     * recover all translog files found on disk
+     * 找到所有需要恢复的 translog 文件
+     */
     private ArrayList<TranslogReader> recoverFromFiles(Checkpoint checkpoint) throws IOException {
         boolean success = false;
         ArrayList<TranslogReader> foundTranslogs = new ArrayList<>();

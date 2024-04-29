@@ -1389,7 +1389,7 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
             // we may not expose operations that were indexed with a refresh listener that was immediately
             // responded to in addRefreshListener. The refresh must happen under the same mutex used in addRefreshListener
             // and before moving this shard to POST_RECOVERY state (i.e., allow to read from this shard).
-            getEngine().refresh("post_recovery");
+            getEngine().refresh("post_recovery"); // 再次执行刷新
             synchronized (mutex) {
                 if (state == IndexShardState.CLOSED) {
                     throw new IndexShardClosedException(shardId);
@@ -1398,7 +1398,7 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
                     throw new IndexShardStartedException(shardId);
                 }
                 recoveryState.setStage(RecoveryState.Stage.DONE);
-                changeState(IndexShardState.POST_RECOVERY, reason);
+                changeState(IndexShardState.POST_RECOVERY, reason); // 更新分片状态
             }
         }
     }
@@ -1885,13 +1885,17 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         }
     }
 
+    /**
+     * 主分片从本地恢复
+     * @param listener
+     */
     public void recoverFromStore(ActionListener<Boolean> listener) {
         // we are the first primary, recover from the gateway
         // if its post api allocation, the index should exists
         assert shardRouting.primary() : "recover from store only makes sense if the shard is a primary shard";
         assert shardRouting.initializing() : "can only start recovery on initializing shard";
         StoreRecovery storeRecovery = new StoreRecovery(shardId, logger);
-        storeRecovery.recoverFromStore(this, listener);
+        storeRecovery.recoverFromStore(this, listener); // 主分片从本地恢复
     }
 
     public void restoreFromRepository(Repository repository, ActionListener<Boolean> listener) {
@@ -2604,10 +2608,10 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         assert recoveryState.getRecoverySource().equals(shardRouting.recoverySource());
         switch (recoveryState.getRecoverySource().getType()) {
             case EMPTY_STORE:
-            case EXISTING_STORE:
+            case EXISTING_STORE: // 主分片从本地恢复
                 executeRecovery("from store", recoveryState, recoveryListener, this::recoverFromStore);
                 break;
-            case PEER:
+            case PEER: // 副分片从远程主分片恢复
                 try {
                     markAsRecovering("from " + recoveryState.getSourceNode(), recoveryState);
                     recoveryTargetService.startRecovery(this, recoveryState.getSourceNode(), recoveryListener);
@@ -2617,7 +2621,7 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
                         new RecoveryFailedException(recoveryState, null, e), true);
                 }
                 break;
-            case SNAPSHOT:
+            case SNAPSHOT: // 从快照恢复
                 final String repo = ((SnapshotRecoverySource) recoveryState.getRecoverySource()).snapshot().getRepository();
                 executeRecovery("from snapshot",
                     recoveryState, recoveryListener, l -> restoreFromRepository(repositoriesService.repository(repo), l));
@@ -2645,6 +2649,7 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
 
                 if (numShards == startedShards.size()) {
                     assert requiredShards.isEmpty() == false;
+                    // 从本节点其他分片恢复(shrink时)
                     executeRecovery("from local shards", recoveryState, recoveryListener,
                         l -> recoverFromLocalShards(mappingUpdateConsumer,
                             startedShards.stream().filter((s) -> requiredShards.contains(s.shardId())).collect(Collectors.toList()), l));
@@ -2670,9 +2675,13 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         markAsRecovering(reason, recoveryState); // mark the shard as recovering on the cluster state thread
         threadPool.generic().execute(ActionRunnable.wrap(ActionListener.wrap(r -> {
                 if (r) {
+                    // 恢复成功
+                    // 向Master发送action为 internal:cluster/shard/started的RPC请求
                     recoveryListener.onRecoveryDone(recoveryState);
                 }
             },
+            // 恢复失败
+            // 关闭Engine，向Master发送 internal:cluster/shard/failure的RPC请求
             e -> recoveryListener.onRecoveryFailure(recoveryState, new RecoveryFailedException(recoveryState, null, e), true)), action));
     }
 

@@ -300,7 +300,7 @@ public class RecoveryTarget extends AbstractRefCounted implements RecoveryTarget
         ActionListener.completeWith(listener, () -> {
             indexShard.updateGlobalCheckpointOnReplica(globalCheckpoint, "finalizing recovery");
             // Persist the global checkpoint.
-            indexShard.sync();
+            indexShard.sync(); // global checkpoint数据持久化
             indexShard.persistRetentionLeases();
             if (trimAboveSeqNo != SequenceNumbers.UNASSIGNED_SEQ_NO) {
                 // We should erase all translog operations above trimAboveSeqNo as we have received either the same or a newer copy
@@ -316,7 +316,7 @@ public class RecoveryTarget extends AbstractRefCounted implements RecoveryTarget
             if (hasUncommittedOperations()) {
                 indexShard.flush(new FlushRequest().force(true).waitIfOngoing(true));
             }
-            indexShard.finalizeRecovery();
+            indexShard.finalizeRecovery(); // 进入FINALIZE阶段
             return null;
         });
     }
@@ -397,6 +397,7 @@ public class RecoveryTarget extends AbstractRefCounted implements RecoveryTarget
         ActionListener.completeWith(listener, () -> {
             indexShard.resetRecoveryStage();
             indexShard.prepareForIndexRecovery();
+            // Target在此主要记录发送过来的快照文件的相关信息，如文件名、文件大小、事务日志等相关信息
             final RecoveryState.Index index = state().getIndex();
             for (int i = 0; i < phase1ExistingFileNames.size(); i++) {
                 index.addFileDetail(phase1ExistingFileNames.get(i), phase1ExistingFileSizes.get(i), true);
@@ -419,10 +420,12 @@ public class RecoveryTarget extends AbstractRefCounted implements RecoveryTarget
             // first, we go and move files that were created with the recovery id suffix to
             // the actual names, its ok if we have a corrupted index here, since we have replicas
             // to recover from in case of a full cluster shutdown just when this code executes...
+            // 将从Source端接收文件时创建的临时命名为正式文件，根据注释可知可能会覆盖Target端已有文件。
             multiFileWriter.renameAllTempFiles();
             final Store store = store();
             store.incRef();
             try {
+                // Target端清理本地原有文件，但是根据Source端发送过来恢复信息判断恢复之后不需要的文件，并对接收的文件进行验证
                 store.cleanupAndVerify("recovery CleanFilesRequestHandler", sourceMetadata);
                 if (indexShard.indexSettings().getIndexVersionCreated().before(Version.V_6_0_0_rc1)) {
                     store.ensureIndexHasHistoryUUID();
@@ -438,8 +441,8 @@ public class RecoveryTarget extends AbstractRefCounted implements RecoveryTarget
                 } else {
                     assert indexShard.assertRetentionLeasesPersisted();
                 }
-                indexShard.maybeCheckIndex();
-                state().setStage(RecoveryState.Stage.TRANSLOG);
+                indexShard.maybeCheckIndex(); // 进入VERIFY_INDEX阶段，检查Lucene索引是否有损害
+                state().setStage(RecoveryState.Stage.TRANSLOG); // 开始进入TransLog阶段
             } catch (CorruptIndexException | IndexFormatTooNewException | IndexFormatTooOldException ex) {
                 // this is a fatal exception at this stage.
                 // this means we transferred files from the remote that have not be checksummed and they are
@@ -475,7 +478,7 @@ public class RecoveryTarget extends AbstractRefCounted implements RecoveryTarget
                                boolean lastChunk, int totalTranslogOps, ActionListener<Void> listener) {
         try {
             state().getTranslog().totalOperations(totalTranslogOps);
-            multiFileWriter.writeFileChunk(fileMetadata, position, content, lastChunk);
+            multiFileWriter.writeFileChunk(fileMetadata, position, content, lastChunk);  // 单个Writer，副本shard对应Lucene文件写入
             listener.onResponse(null);
         } catch (Exception e) {
             listener.onFailure(e);

@@ -80,6 +80,8 @@ import static org.elasticsearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO;
  * <p>
  * Note, it can be safely assumed that there will only be a single recovery per shard (index+id) and
  * not several of them (since we don't allocate several shard replicas to the same node).
+ *
+ * 副本分片所在的node
  */
 public class PeerRecoveryTargetService implements IndexEventListener {
 
@@ -113,22 +115,22 @@ public class PeerRecoveryTargetService implements IndexEventListener {
         this.onGoingRecoveries = new RecoveriesCollection(logger, threadPool);
 
         transportService.registerRequestHandler(Actions.FILES_INFO, ThreadPool.Names.GENERIC, RecoveryFilesInfoRequest::new,
-            new FilesInfoRequestHandler());
+            new FilesInfoRequestHandler()); // 负责接受处理Source端Shard快照文件（核心是把对应的元数据信息进行记录）
         transportService.registerRequestHandler(Actions.FILE_CHUNK, ThreadPool.Names.GENERIC, RecoveryFileChunkRequest::new,
-            new FileChunkTransportRequestHandler());
+            new FileChunkTransportRequestHandler()); // 负责接受Source端发送的Shard文件块（核心是Lucene文件恢复）
         transportService.registerRequestHandler(Actions.CLEAN_FILES, ThreadPool.Names.GENERIC,
-            RecoveryCleanFilesRequest::new, new CleanFilesRequestHandler());
+            RecoveryCleanFilesRequest::new, new CleanFilesRequestHandler()); // 负责将接受到的Shard文件更改为正式文件
         transportService.registerRequestHandler(Actions.PREPARE_TRANSLOG, ThreadPool.Names.GENERIC,
-                RecoveryPrepareForTranslogOperationsRequest::new, new PrepareForTranslogOperationsRequestHandler());
+                RecoveryPrepareForTranslogOperationsRequest::new, new PrepareForTranslogOperationsRequestHandler()); // 负责打开Engine，准备接受Source端Translog进行日志重放
         transportService.registerRequestHandler(Actions.TRANSLOG_OPS, ThreadPool.Names.GENERIC, RecoveryTranslogOperationsRequest::new,
-            new TranslogOperationsRequestHandler());
+            new TranslogOperationsRequestHandler()); // 负责接受Source端Translog，进行日志重放
         transportService.registerRequestHandler(Actions.FINALIZE, ThreadPool.Names.GENERIC, RecoveryFinalizeRecoveryRequest::new,
-            new FinalizeRecoveryRequestHandler());
+            new FinalizeRecoveryRequestHandler()); // 负责刷新Engine，让新的Segment生效，回收旧的文件，更新global checkpoint等
         transportService.registerRequestHandler(
                 Actions.HANDOFF_PRIMARY_CONTEXT,
                 ThreadPool.Names.GENERIC,
                 RecoveryHandoffPrimaryContextRequest::new,
-                new HandoffPrimaryContextRequestHandler());
+                new HandoffPrimaryContextRequestHandler()); // 如果是主分片relocate，则负责接受主分片身份
     }
 
     @Override
@@ -140,9 +142,12 @@ public class PeerRecoveryTargetService implements IndexEventListener {
 
     public void startRecovery(final IndexShard indexShard, final DiscoveryNode sourceNode, final RecoveryListener listener) {
         // create a new recovery status, and process...
+        // 创建新的RecoveryTarget，并返回该RecoveryTarget对应的ID
+        // 在发送START_RECOVERY给Source端时会同时发送该ID，后续Source端发送恢复流程中的request也会带上该ID，Target端根据该ID找到RecoveryTarget进行请求处理
         final long recoveryId = onGoingRecoveries.startRecovery(indexShard, sourceNode, listener, recoverySettings.activityTimeout());
         // we fork off quickly here and go async but this is called from the cluster state applier thread too and that can cause
         // assertions to trip if we executed it on the same thread hence we fork off to the generic threadpool.
+        // Target具体恢复流程放在RecoveryRunner中
         threadPool.generic().execute(new RecoveryRunner(recoveryId));
     }
 
@@ -190,7 +195,9 @@ public class PeerRecoveryTargetService implements IndexEventListener {
                     indexShard.preRecovery();
                     assert recoveryTarget.sourceNode() != null : "can not do a recovery without a source node";
                     logger.trace("{} preparing shard for peer recovery", recoveryTarget.shardId());
-                    indexShard.prepareForIndexRecovery();
+
+                    indexShard.prepareForIndexRecovery(); // 进入到INIT阶段
+
                     final long startingSeqNo = indexShard.recoverLocallyUpToGlobalCheckpoint();
                     assert startingSeqNo == UNASSIGNED_SEQ_NO || recoveryTarget.state().getStage() == RecoveryState.Stage.TRANSLOG :
                         "unexpected recovery stage [" + recoveryTarget.state().getStage() + "] starting seqno [ " + startingSeqNo + "]";
@@ -216,11 +223,14 @@ public class PeerRecoveryTargetService implements IndexEventListener {
 
         try {
             cancellableThreads.executeIO(() ->
+                // 在GENERIC线程池内，使用新的cancellableThreads线程（线程可以被中断）执行RPC操作
                 // we still execute under cancelableThreads here to ensure we interrupt any blocking call to the network if any
                 // on the underlying transport. It's unclear if we need this here at all after moving to async execution but
                 // the issues that a missing call to this could cause are sneaky and hard to debug. If we don't need it on this
                 // call we can potentially remove it altogether which we should do it in a major release only with enough
                 // time to test. This shoudl be done for 7.0 if possible
+                // 发送START_RECOVERY到Source端，启动Source端恢复流程
+                //发送RPC请求，对应的ACTION是PeerRecoverySourceService.Actions.START_RECOVERY
                 transportService.sendRequest(startRequest.sourceNode(), actionName, requestToSend, responseHandler)
             );
         } catch (CancellableThreads.ExecutionCancelledException e) {
@@ -295,6 +305,12 @@ public class PeerRecoveryTargetService implements IndexEventListener {
 
     class PrepareForTranslogOperationsRequestHandler implements TransportRequestHandler<RecoveryPrepareForTranslogOperationsRequest> {
 
+        /**
+         * 启动Engine，使副分片可以正常接收写请求
+         * @param request
+         * @param channel
+         * @param task
+         */
         @Override
         public void messageReceived(RecoveryPrepareForTranslogOperationsRequest request, TransportChannel channel, Task task) {
             try (RecoveryRef recoveryRef = onGoingRecoveries.getRecoverySafe(request.recoveryId(), request.shardId())) {
@@ -302,7 +318,7 @@ public class PeerRecoveryTargetService implements IndexEventListener {
                 if (listener == null) {
                     return;
                 }
-
+                // 副本分片启动Engine，使副分片可以正常接收写请求
                 recoveryRef.target().prepareForTranslogOperations(request.totalTranslogOps(), listener);
             }
         }
@@ -310,8 +326,16 @@ public class PeerRecoveryTargetService implements IndexEventListener {
 
     class FinalizeRecoveryRequestHandler implements TransportRequestHandler<RecoveryFinalizeRecoveryRequest> {
 
+        /**
+         * 负责刷新Engine，让新的Segment生效，回收旧的文件，更新global checkpoint
+         * @param request
+         * @param channel
+         * @param task
+         * @throws Exception
+         */
         @Override
         public void messageReceived(RecoveryFinalizeRecoveryRequest request, TransportChannel channel, Task task) throws Exception {
+            // 根据RecoveryId获取对应的RecoveryRef
             try (RecoveryRef recoveryRef = onGoingRecoveries.getRecoverySafe(request.recoveryId(), request.shardId())) {
                 final ActionListener<Void> listener = createOrFinishListener(recoveryRef, channel, Actions.FINALIZE, request);
                 if (listener == null) {
@@ -338,11 +362,19 @@ public class PeerRecoveryTargetService implements IndexEventListener {
 
     class TranslogOperationsRequestHandler implements TransportRequestHandler<RecoveryTranslogOperationsRequest> {
 
+        /**
+         * 接受Source端Translog，进行Translog重放
+         * @param request
+         * @param channel
+         * @param task
+         * @throws IOException
+         */
         @Override
         public void messageReceived(final RecoveryTranslogOperationsRequest request, final TransportChannel channel,
                                     Task task) throws IOException {
+            // 根据RecoveryId获取对应的RecoveryRef
             try (RecoveryRef recoveryRef = onGoingRecoveries.getRecoverySafe(request.recoveryId(), request.shardId())) {
-                final RecoveryTarget recoveryTarget = recoveryRef.target();
+                final RecoveryTarget recoveryTarget = recoveryRef.target(); // 获取对应的RecoveryTarget
                 final ActionListener<Void> listener = createOrFinishListener(recoveryRef, channel, Actions.TRANSLOG_OPS, request,
                     nullVal -> new RecoveryTranslogOperationsResponse(recoveryTarget.indexShard().getLocalCheckpoint()));
                 if (listener == null) {
@@ -414,6 +446,13 @@ public class PeerRecoveryTargetService implements IndexEventListener {
 
     class FilesInfoRequestHandler implements TransportRequestHandler<RecoveryFilesInfoRequest> {
 
+        /**
+         * Target端接收FILES_INFO请求后，会使用注册的FilesInfoRequestHandler
+         * @param request
+         * @param channel
+         * @param task
+         * @throws Exception
+         */
         @Override
         public void messageReceived(RecoveryFilesInfoRequest request, TransportChannel channel, Task task) throws Exception {
             try (RecoveryRef recoveryRef = onGoingRecoveries.getRecoverySafe(request.recoveryId(), request.shardId())) {
@@ -431,6 +470,13 @@ public class PeerRecoveryTargetService implements IndexEventListener {
 
     class CleanFilesRequestHandler implements TransportRequestHandler<RecoveryCleanFilesRequest> {
 
+        /**
+         * Source端发送完所有差异文件之后，会发送CLEAN_FILES请求给Target端，Shard文件更改为正式文件
+         * @param request
+         * @param channel
+         * @param task
+         * @throws Exception
+         */
         @Override
         public void messageReceived(RecoveryCleanFilesRequest request, TransportChannel channel, Task task) throws Exception {
             try (RecoveryRef recoveryRef = onGoingRecoveries.getRecoverySafe(request.recoveryId(), request.shardId())) {
@@ -450,10 +496,18 @@ public class PeerRecoveryTargetService implements IndexEventListener {
         // How many bytes we've copied since we last called RateLimiter.pause
         final AtomicLong bytesSinceLastPause = new AtomicLong();
 
+        /**
+         * Target端接收Source端发送过来的文件
+         * @param request
+         * @param channel
+         * @param task
+         * @throws Exception
+         */
         @Override
         public void messageReceived(final RecoveryFileChunkRequest request, TransportChannel channel, Task task) throws Exception {
+            // 根据RecoveryId获取对应的RecoveryRef
             try (RecoveryRef recoveryRef = onGoingRecoveries.getRecoverySafe(request.recoveryId(), request.shardId())) {
-                final RecoveryTarget recoveryTarget = recoveryRef.target();
+                final RecoveryTarget recoveryTarget = recoveryRef.target(); // 获取对应的RecoveryTarget
                 final ActionListener<Void> listener = createOrFinishListener(recoveryRef, channel, Actions.FILE_CHUNK, request);
                 if (listener == null) {
                     return;
@@ -464,7 +518,7 @@ public class PeerRecoveryTargetService implements IndexEventListener {
                     indexState.addSourceThrottling(request.sourceThrottleTimeInNanos());
                 }
 
-                RateLimiter rateLimiter = recoverySettings.rateLimiter();
+                RateLimiter rateLimiter = recoverySettings.rateLimiter(); // 这里默认使用Lucene的SimpleRateLimiter实现限速
                 if (rateLimiter != null) {
                     long bytes = bytesSinceLastPause.addAndGet(request.content().length());
                     if (bytes > rateLimiter.getMinPauseCheckBytes()) {
@@ -475,6 +529,7 @@ public class PeerRecoveryTargetService implements IndexEventListener {
                         recoveryTarget.indexShard().recoveryStats().addThrottleTime(throttleTimeInNanos);
                     }
                 }
+                // Lucene文件恢复
                 recoveryTarget.writeFileChunk(request.metadata(), request.position(), request.content(), request.lastChunk(),
                     request.totalTranslogOps(), listener);
             }
@@ -556,7 +611,7 @@ public class PeerRecoveryTargetService implements IndexEventListener {
         public void handleResponse(RecoveryResponse recoveryResponse) {
             final TimeValue recoveryTime = new TimeValue(timer.time());
             // do this through ongoing recoveries to remove it from the collection
-            onGoingRecoveries.markRecoveryAsDone(recoveryId);
+            onGoingRecoveries.markRecoveryAsDone(recoveryId); // 响应成功，设置为DONE阶段
             if (logger.isTraceEnabled()) {
                 StringBuilder sb = new StringBuilder();
                 sb.append('[').append(request.shardId().getIndex().getName()).append(']')

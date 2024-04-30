@@ -126,7 +126,7 @@ public class RemoteRecoveryTargetHandler implements RecoveryTargetHandler {
             TransportRequestOptions.builder().withTimeout(recoverySettings.internalActionLongTimeout()).build();
         final Writeable.Reader<TransportResponse.Empty> reader = in -> TransportResponse.Empty.INSTANCE;
         final ActionListener<TransportResponse.Empty> responseListener = ActionListener.map(listener, r -> null);
-        executeRetryableAction(action, request, options, responseListener, reader);
+        executeRetryableAction(action, request, options, responseListener, reader); // 发送RPC请求，对应Actions.FINALIZE
     }
 
     @Override
@@ -150,6 +150,7 @@ public class RemoteRecoveryTargetHandler implements RecoveryTargetHandler {
             final ActionListener<Long> listener) {
         final String action = PeerRecoveryTargetService.Actions.TRANSLOG_OPS;
         final long requestSeqNo = requestSeqNoGenerator.getAndIncrement();
+        // Request构建
         final RecoveryTranslogOperationsRequest request = new RecoveryTranslogOperationsRequest(
                 recoveryId,
                 requestSeqNo,
@@ -162,21 +163,31 @@ public class RemoteRecoveryTargetHandler implements RecoveryTargetHandler {
                 mappingVersionOnPrimary);
         final Writeable.Reader<RecoveryTranslogOperationsResponse> reader = RecoveryTranslogOperationsResponse::new;
         final ActionListener<RecoveryTranslogOperationsResponse> responseListener = ActionListener.map(listener, r -> r.localCheckpoint);
+        // 发送RPC请求，对应Actions.TRANSLOG_OPS
         executeRetryableAction(action, request, translogOpsRequestOptions, responseListener, reader);
     }
 
+    /**
+     * 发送PeerRecoveryTargetService.Actions.FILES_INFO对应的Action请求
+     * @param phase1FileNames
+     * @param phase1FileSizes
+     * @param phase1ExistingFileNames
+     * @param phase1ExistingFileSizes
+     * @param totalTranslogOps
+     * @param listener
+     */
     @Override
     public void receiveFileInfo(List<String> phase1FileNames, List<Long> phase1FileSizes, List<String> phase1ExistingFileNames,
                                 List<Long> phase1ExistingFileSizes, int totalTranslogOps, ActionListener<Void> listener) {
         final String action = PeerRecoveryTargetService.Actions.FILES_INFO;
         final long requestSeqNo = requestSeqNoGenerator.getAndIncrement();
         RecoveryFilesInfoRequest request = new RecoveryFilesInfoRequest(recoveryId, requestSeqNo, shardId, phase1FileNames, phase1FileSizes,
-            phase1ExistingFileNames, phase1ExistingFileSizes, totalTranslogOps);
+            phase1ExistingFileNames, phase1ExistingFileSizes, totalTranslogOps); // Request构建
         final TransportRequestOptions options =
             TransportRequestOptions.builder().withTimeout(recoverySettings.internalActionTimeout()).build();
         final Writeable.Reader<TransportResponse.Empty> reader = in -> TransportResponse.Empty.INSTANCE;
         final ActionListener<TransportResponse.Empty> responseListener = ActionListener.map(listener, r -> null);
-        executeRetryableAction(action, request, options, responseListener, reader);
+        executeRetryableAction(action, request, options, responseListener, reader); // 发送RPC请求，对应Actions.FILES_INFO
     }
 
     @Override
@@ -199,7 +210,7 @@ public class RemoteRecoveryTargetHandler implements RecoveryTargetHandler {
         // Pause using the rate limiter, if desired, to throttle the recovery
         final long throttleTimeInNanos;
         // always fetch the ratelimiter - it might be updated in real-time on the recovery settings
-        final RateLimiter rl = recoverySettings.rateLimiter();
+        final RateLimiter rl = recoverySettings.rateLimiter();  // Lucene的限流器
         if (rl != null) {
             long bytes = bytesSinceLastPause.addAndGet(content.length());
             if (bytes > rl.getMinPauseCheckBytes()) {
@@ -227,6 +238,7 @@ public class RemoteRecoveryTargetHandler implements RecoveryTargetHandler {
         final RecoveryFileChunkRequest request = new RecoveryFileChunkRequest(
             recoveryId, requestSeqNo, shardId, fileMetadata, position, content, lastChunk, totalTranslogOps, throttleTimeInNanos);
         final Writeable.Reader<TransportResponse.Empty> reader = in -> TransportResponse.Empty.INSTANCE;
+        // 发送RPC请求，对应Actions.FILE_CHUNK
         executeRetryableAction(action, request, fileChunkRequestOptions, ActionListener.map(listener, r -> null), reader);
     }
 

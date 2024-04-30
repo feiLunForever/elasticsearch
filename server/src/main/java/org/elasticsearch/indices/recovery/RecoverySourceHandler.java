@@ -145,6 +145,7 @@ public class RecoverySourceHandler {
 
     /**
      * performs the recovery from the local engine to the target
+     * 启动恢复流程
      */
     public void recoverToTarget(ActionListener<RecoveryResponse> listener) {
         addListener(listener);
@@ -295,6 +296,7 @@ public class RecoverySourceHandler {
             sendFileStep.whenComplete(r -> {
                 assert Transports.assertNotTransportThread(RecoverySourceHandler.this + "[prepareTargetForTranslog]");
                 // For a sequence based recovery, the target can keep its local translog
+                // 发送PREPARE TRANSLOG请求让Target打开Engine，准备接收Translog重放
                 prepareTargetForTranslog(
                     shard.estimateNumberOfHistoryOperations("peer-recovery", historySource, startingSeqNo), prepareEngineStep);
             }, onFailure);
@@ -330,6 +332,7 @@ public class RecoverySourceHandler {
 
             // Recovery target can trim all operations >= startingSeqNo as we have sent all these operations in the phase 2
             final long trimAboveSeqNo = startingSeqNo - 1;
+            // 发送FINALIZE请求让Target刷新Engine，让新的Segment生效，回收旧的文件，更新global checkpoint等
             sendSnapshotStep.whenComplete(r -> finalizeRecovery(r.targetLocalCheckpoint, trimAboveSeqNo, finalizeStep), onFailure);
 
             finalizeStep.whenComplete(r -> {
@@ -486,6 +489,7 @@ public class RecoverySourceHandler {
                             recoverySourceMetadata.asMap().size() + " files", name);
                 }
             }
+            // 可以跳过phase1，源分片和目标分片的syncId一致且doc数量相同
             if (canSkipPhase1(recoverySourceMetadata, request.metadataSnapshot()) == false) {
                 final List<String> phase1FileNames = new ArrayList<>();
                 final List<Long> phase1FileSizes = new ArrayList<>();
@@ -534,15 +538,16 @@ public class RecoverySourceHandler {
                 final StepListener<RetentionLease> createRetentionLeaseStep = new StepListener<>();
                 final StepListener<Void> cleanFilesStep = new StepListener<>();
                 cancellableThreads.checkForCancel();
+                // 发送PeerRecoveryTargetService.Actions.FILES_INFO对应的Action请求
                 recoveryTarget.receiveFileInfo(phase1FileNames, phase1FileSizes, phase1ExistingFileNames,
                         phase1ExistingFileSizes, translogOps.getAsInt(), sendFileInfoStep);
 
-                sendFileInfoStep.whenComplete(r ->
+                sendFileInfoStep.whenComplete(r -> // phase1阶段1内，发送文件内容，通过文件块FILE_CHUNK的方式，将文件发送给Target端
                     sendFiles(store, phase1Files.toArray(new StoreFileMetadata[0]), translogOps, sendFilesStep), listener::onFailure);
 
                 sendFilesStep.whenComplete(r -> createRetentionLease(startingSeqNo, createRetentionLeaseStep), listener::onFailure);
 
-                createRetentionLeaseStep.whenComplete(retentionLease ->
+                createRetentionLeaseStep.whenComplete(retentionLease -> // 发送CLEAN FILES告诉Target端将临时文件更名为正式文件
                     {
                         final long lastKnownGlobalCheckpoint = shard.getLastKnownGlobalCheckpoint();
                         assert retentionLease == null || retentionLease.retainingSequenceNumber() - 1 <= lastKnownGlobalCheckpoint
@@ -551,6 +556,7 @@ public class RecoverySourceHandler {
                         // the commit we just copied to be a safe commit on the replica, so why not set the global checkpoint on the replica
                         // to the max seqno of this commit? Because (in rare corner cases) this commit might not be a safe commit here on
                         // the primary, and in these cases the max seqno would be too high to be valid as a global checkpoint.
+                        // 发送RPC请求，对应Actions.CLEAN_FILES
                         cleanFiles(store, recoverySourceMetadata, translogOps, lastKnownGlobalCheckpoint, cleanFilesStep);
                     },
                     listener::onFailure);
@@ -619,9 +625,11 @@ public class RecoverySourceHandler {
     }
 
     boolean canSkipPhase1(Store.MetadataSnapshot source, Store.MetadataSnapshot target) {
+        // 条件1:源的syncid和目标的syncid一致，且不为null
         if (source.getSyncId() == null || source.getSyncId().equals(target.getSyncId()) == false) {
             return false;
         }
+        // 条件2:源的docnum和目标的docnum一致
         if (source.getNumDocs() != target.getNumDocs()) {
             throw new IllegalStateException("try to recover " + request.shardId() + " from primary shard with sync id but number " +
                 "of docs differ: " + source.getNumDocs() + " (" + request.sourceNode().getName() + ", primary) vs " + target.getNumDocs()
@@ -629,15 +637,22 @@ public class RecoverySourceHandler {
         }
         SequenceNumbers.CommitInfo sourceSeqNos = SequenceNumbers.loadSeqNoInfoFromLuceneCommit(source.getCommitUserData().entrySet());
         SequenceNumbers.CommitInfo targetSeqNos = SequenceNumbers.loadSeqNoInfoFromLuceneCommit(target.getCommitUserData().entrySet());
+        // 条件3: 基于源seqno的本地checkpoint和基于目标seqno的本地checkpoint一致
         if (sourceSeqNos.localCheckpoint != targetSeqNos.localCheckpoint || targetSeqNos.maxSeqNo != sourceSeqNos.maxSeqNo) {
             final String message = "try to recover " + request.shardId() + " with sync id but " +
                 "seq_no stats are mismatched: [" + source.getCommitUserData() + "] vs [" + target.getCommitUserData() + "]";
             assert false : message;
             throw new IllegalStateException(message);
         }
+        // 可以跳过phase1，源分片和目标分片的syncId一致且doc数量相同
         return true;
     }
 
+    /**
+     * 发送RPC请求，对应Actions.PREPARE_TRANSLOG
+     * @param totalTranslogOps
+     * @param listener
+     */
     void prepareTargetForTranslog(int totalTranslogOps, ActionListener<TimeValue> listener) {
         StopWatch stopWatch = new StopWatch().start();
         final ActionListener<Void> wrappedListener = ActionListener.wrap(
@@ -899,6 +914,7 @@ public class RecoverySourceHandler {
     void sendFiles(Store store, StoreFileMetadata[] files, IntSupplier translogOps, ActionListener<Void> listener) {
         ArrayUtil.timSort(files, Comparator.comparingLong(StoreFileMetadata::length)); // send smallest first
 
+        // 匿名内部类，依靠AsyncIOProcessor异步发送塑化剂
         final MultiChunkTransfer<StoreFileMetadata, FileChunk>multiFileSender = new MultiChunkTransfer<StoreFileMetadata, FileChunk>(
             logger, threadPool.getThreadContext(), listener, maxConcurrentFileChunks, Arrays.asList(files)) {
 
@@ -962,9 +978,17 @@ public class RecoverySourceHandler {
                 }
             };
         resources.add(multiFileSender);
-        multiFileSender.start();
+        multiFileSender.start(); // 发送数据交给AsyncIOProcessor处理
     }
 
+    /**
+     * 发送RPC请求，对应Actions.CLEAN_FILES
+     * @param store
+     * @param sourceMetadata
+     * @param translogOps
+     * @param globalCheckpoint
+     * @param listener
+     */
     private void cleanFiles(Store store, Store.MetadataSnapshot sourceMetadata, IntSupplier translogOps,
                             long globalCheckpoint, ActionListener<Void> listener) {
         // Send the CLEAN_FILES request, which takes all of the files that

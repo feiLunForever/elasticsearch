@@ -59,6 +59,7 @@ import java.util.Map;
 /**
  * The source recovery accepts recovery requests from other peer shards and start the recovery process from this
  * source shard to the target shard.
+ * 主分片所在的node
  */
 public class PeerRecoverySourceService extends AbstractLifecycleComponent implements IndexEventListener, ClusterStateListener {
 
@@ -83,7 +84,7 @@ public class PeerRecoverySourceService extends AbstractLifecycleComponent implem
         // When the target node wants to start a peer recovery it sends a START_RECOVERY request to the source
         // node. Upon receiving START_RECOVERY, the source node will initiate the peer recovery.
         transportService.registerRequestHandler(Actions.START_RECOVERY, ThreadPool.Names.GENERIC, StartRecoveryRequest::new,
-            new StartRecoveryTransportRequestHandler());
+            new StartRecoveryTransportRequestHandler()); // 主要负责处理Target端启动恢复的请求，创建RecoverySourceHandler对象实例，开始恢复流程
         // When the target node's START_RECOVERY request has failed due to a network disconnection, it will
         // send a REESTABLISH_RECOVERY. This attempts to reconnect to an existing recovery process taking
         // place on the source node. If the recovery process no longer exists, then the REESTABLISH_RECOVERY
@@ -132,11 +133,11 @@ public class PeerRecoverySourceService extends AbstractLifecycleComponent implem
 
     private void recover(StartRecoveryRequest request, ActionListener<RecoveryResponse> listener) {
         final IndexService indexService = indicesService.indexServiceSafe(request.shardId().getIndex());
-        final IndexShard shard = indexService.getShard(request.shardId().id());
+        final IndexShard shard = indexService.getShard(request.shardId().id()); // 根据shardId获取对应的IndexShard
 
-        final ShardRouting routingEntry = shard.routingEntry();
+        final ShardRouting routingEntry = shard.routingEntry(); // 获取对应的ShardRouting（标识分片的状态、所属Node等信息）
 
-        if (routingEntry.primary() == false || routingEntry.active() == false) {
+        if (routingEntry.primary() == false || routingEntry.active() == false) { // 判断routingEntry是否为主、routingEntry是否active，否抛错
             throw new DelayRecoveryException("source shard [" + routingEntry + "] is not an active primary");
         }
 
@@ -147,9 +148,12 @@ public class PeerRecoverySourceService extends AbstractLifecycleComponent implem
             throw new DelayRecoveryException("source shard is not marked yet as relocating to [" + request.targetNode() + "]");
         }
 
+        // 根据request得到shard并构造RecoverySourceHandler对象
+        // 这里创建RecoverySourceHandler用于主导恢复流程
         RecoverySourceHandler handler = ongoingRecoveries.addNewRecovery(request, shard);
         logger.trace("[{}][{}] starting recovery to {}", request.shardId().getIndex().getName(), request.shardId().id(),
             request.targetNode());
+        // 实际的恢复流程函数，Source端所有的恢复流程都是这个函数定义的，后续的恢复流程都是Source主导，发送各种请求让Target端进行文件恢复、Translog重放等。
         handler.recoverToTarget(ActionListener.runAfter(listener, () -> ongoingRecoveries.remove(shard, handler)));
     }
 
@@ -165,6 +169,8 @@ public class PeerRecoverySourceService extends AbstractLifecycleComponent implem
     class StartRecoveryTransportRequestHandler implements TransportRequestHandler<StartRecoveryRequest> {
         @Override
         public void messageReceived(final StartRecoveryRequest request, final TransportChannel channel, Task task) throws Exception {
+            // Source端处理START_RECOVERY请求Handler调用
+            // PeerRecoverySourceService开启恢复流程
             recover(request, new ChannelActionListener<>(channel, Actions.START_RECOVERY, request));
         }
     }
@@ -323,6 +329,8 @@ public class PeerRecoverySourceService extends AbstractLifecycleComponent implem
             private Tuple<RecoverySourceHandler, RemoteRecoveryTargetHandler> createRecoverySourceHandler(StartRecoveryRequest request,
                                                                                                           IndexShard shard) {
                 RecoverySourceHandler handler;
+                // RecoverySourceHandler会持有一个RemoteRecoveryTargetHandler
+                // 用于和Target端进行交互，后续各种请求都是通过这个对象进行交互的。
                 final RemoteRecoveryTargetHandler recoveryTarget =
                     new RemoteRecoveryTargetHandler(request.recoveryId(), request.shardId(), transportService,
                         request.targetNode(), recoverySettings, throttleTime -> shard.recoveryStats().addThrottleTime(throttleTime));

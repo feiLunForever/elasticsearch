@@ -1410,7 +1410,7 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         if (state != IndexShardState.RECOVERING) {
             throw new IndexShardNotRecoveringException(shardId, state);
         }
-        recoveryState.setStage(RecoveryState.Stage.INDEX);
+        recoveryState.setStage(RecoveryState.Stage.INDEX); // 标记进入INDEX阶段
         assert currentEngineReference.get() == null;
     }
 
